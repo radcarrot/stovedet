@@ -538,24 +538,39 @@ class VLMVerifier:
 # =========================================================
 def draw_hud(img, frame_idx, fps, danger_count, touch_count, active_dangers):
     ih, iw = img.shape[:2]
-    x1, y1, x2, y2 = 10, 10, 380, 135
+    
+    # Sleek dark semi-transparent panel for stats
+    x1, y1, x2, y2 = 15, 15, 300, 115
     panel = img[y1:y2, x1:x2].copy()
-    img[y1:y2, x1:x2] = cv2.addWeighted(np.zeros_like(panel), 0.7, panel, 0.3, 0)
-    cv2.rectangle(img, (x1, y1), (x2, y2), (60, 60, 60), 1)
+    img[y1:y2, x1:x2] = cv2.addWeighted(panel, 0.25, np.zeros_like(panel), 0.75, 0)
+    cv2.rectangle(img, (x1, y1), (x2, y2), (200, 200, 200), 1)
 
-    cv2.putText(img, f"DANGER EVENTS : {danger_count}", (20, 50),
-                cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 0, 255), 2)
-    cv2.putText(img, f"TOUCH EVENTS  : {touch_count}", (20, 90),
-                cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 165, 255), 2)
-    cv2.putText(img, f"Frame {frame_idx}  {round(frame_idx/fps,1)}s", (20, 122),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (130, 130, 130), 1)
+    cv2.putText(img, f"DANGER  : {danger_count}", (30, 45),
+                cv2.FONT_HERSHEY_DUPLEX, 0.7, (50, 50, 255), 2)
+    cv2.putText(img, f"TOUCH   : {touch_count}", (30, 75),
+                cv2.FONT_HERSHEY_DUPLEX, 0.7, (50, 170, 255), 2)
+    cv2.putText(img, f"Frame {frame_idx} | {round(frame_idx/fps,1)}s", (30, 100),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
     if active_dangers:
-        banner_y = ih - 55
-        cv2.rectangle(img, (0, banner_y), (iw, ih), (0, 0, 160), -1)
-        cv2.putText(img, "!! DANGER: CHILD AT STOVE !!",
-                    (iw // 2 - 230, ih - 15),
-                    cv2.FONT_HERSHEY_DUPLEX, 1.0, (255, 255, 255), 3)
+        # Pulsing red danger banner at bottom
+        alpha = 0.7 + 0.3 * np.sin(frame_idx * 0.4)
+        banner_h = 60
+        banner_y = ih - banner_h
+        banner_crop = img[banner_y:ih, 0:iw].copy()
+        
+        red_bg = np.zeros_like(banner_crop)
+        red_bg[:] = (0, 0, 180)
+        img[banner_y:ih, 0:iw] = cv2.addWeighted(banner_crop, 1 - alpha, red_bg, alpha, 0)
+        
+        text = "!! DANGER: CHILD AT STOVE !!"
+        font = cv2.FONT_HERSHEY_DUPLEX
+        scale = 1.2
+        thick = 3
+        (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+        cv2.putText(img, text,
+                    (iw // 2 - tw // 2, ih - banner_h // 2 + th // 2),
+                    font, scale, (255, 255, 255), thick)
 
 # =========================================================
 # ZONE PERSISTENCE (Simplified — No Adult Reference Line)
@@ -815,9 +830,13 @@ def process_video(video_path, zone_dict, video_name, live=False):
 
                     label_color = (0, 165, 255) if ps["is_child"] else (0, 200, 0)
                     label_text  = f"{'CHILD' if ps['is_child'] else 'Adult'} #{track_id}"
+                    
+                    # Filled background for label for better readability
+                    (tw, th), tf = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    cv2.rectangle(annotated, (x1, y1 - th - 10), (x1 + tw + 10, y1), label_color, -1)
                     cv2.rectangle(annotated, (x1, y1), (x2, y2), label_color, 2)
-                    cv2.putText(annotated, label_text, (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, label_color, 2)
+                    cv2.putText(annotated, label_text, (x1 + 5, y1 - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
                     if DEBUG_CLASSIFIER:
                         dy = y1 + 18
@@ -889,12 +908,20 @@ def process_video(video_path, zone_dict, video_name, live=False):
                             ps["right_wrist"]["state"] == "DANGER"):
                         active_dangers.append(track_id)
 
-        # Draw stove zone
+        # Draw stove zone with semi-transparent fill
         zone_color = (0, 0, 255) if active_dangers else (40, 140, 200)
+        overlay = annotated.copy()
+        cv2.fillPoly(overlay, [stove_poly], zone_color)
+        annotated = cv2.addWeighted(overlay, 0.25, annotated, 0.75, 0)
         cv2.polylines(annotated, [stove_poly], isClosed=True,
                       color=zone_color, thickness=2)
         cx, cy = stove_poly.mean(axis=0).astype(int)
-        cv2.putText(annotated, "STOVE", (int(cx) - 25, int(cy)),
+        
+        # Stove label with dark background
+        (tw, th), _ = cv2.getTextSize("STOVE", cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(annotated, (int(cx) - tw//2 - 5, int(cy) - th - 5), 
+                      (int(cx) + tw//2 + 5, int(cy) + 5), (0, 0, 0), -1)
+        cv2.putText(annotated, "STOVE", (int(cx) - tw//2, int(cy)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, zone_color, 2)
 
         draw_hud(annotated, frame_idx, fps, danger_count, touch_count, active_dangers)
