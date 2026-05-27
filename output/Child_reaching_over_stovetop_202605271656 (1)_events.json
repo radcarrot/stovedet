@@ -1,0 +1,89 @@
+{
+  "danger_count": 1,
+  "touch_count": 3,
+  "events": [
+    {
+      "event": "TOUCH",
+      "person": 1,
+      "side": "RIGHT",
+      "frame": 90,
+      "time_sec": 3.75
+    },
+    {
+      "event": "DANGER",
+      "person": 1,
+      "side": "RIGHT",
+      "frame": 150,
+      "time_sec": 6.25
+    },
+    {
+      "event": "TOUCH",
+      "person": 1,
+      "side": "LEFT",
+      "frame": 152,
+      "time_sec": 6.33
+    },
+    {
+      "event": "TOUCH",
+      "person": 1,
+      "side": "LEFT",
+      "frame": 186,
+      "time_sec": 7.75
+    }
+  ],
+  "vlm_results": [
+    {
+      "verified": true,
+      "is_child": true,
+      "confidence": 0.62,
+      "description": "[MOCK] Confirmed touch \u2014 child wrist near stove zone.",
+      "mock": true,
+      "event_type": "TOUCH",
+      "person_id": 1,
+      "side": "RIGHT",
+      "frame_idx": 90,
+      "time_sec": 3.75,
+      "clip_path": "output/clips\\Child_reaching_over_stovetop_202605271656 (1)_TOUCH_p1_f90.mp4"
+    },
+    {
+      "verified": true,
+      "is_child": true,
+      "confidence": 0.88,
+      "description": "[MOCK] Confirmed danger \u2014 child wrist near stove zone.",
+      "mock": true,
+      "event_type": "DANGER",
+      "person_id": 1,
+      "side": "RIGHT",
+      "frame_idx": 150,
+      "time_sec": 6.25,
+      "clip_path": "output/clips\\Child_reaching_over_stovetop_202605271656 (1)_DANGER_p1_f150.mp4"
+    },
+    {
+      "verified": true,
+      "is_child": true,
+      "confidence": 0.62,
+      "description": "[MOCK] Confirmed touch \u2014 child wrist near stove zone.",
+      "mock": true,
+      "event_type": "TOUCH",
+      "person_id": 1,
+      "side": "LEFT",
+      "frame_idx": 152,
+      "time_sec": 6.33,
+      "clip_path": "output/clips\\Child_reaching_over_stovetop_202605271656 (1)_TOUCH_p1_f152.mp4"
+    },
+    {
+      "verified": true,
+      "is_child": true,
+      "confidence": 0.62,
+      "description": "[MOCK] Confirmed touch \u2014 child wrist near stove zone.",
+      "mock": true,
+      "event_type": "TOUCH",
+      "person_id": 1,
+      "side": "LEFT",
+      "frame_idx": 186,
+      "time_sec": 7.75,
+      "clip_path": "output/clips\\Child_reaching_over_stovetop_202605271656 (1)_TOUCH_p1_f186.mp4"
+    }
+  ],
+  "vlm_mock_mode": true
+}

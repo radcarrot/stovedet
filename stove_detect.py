@@ -113,7 +113,51 @@ def _midpoint(a, b):
 def _dist(a, b):
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
 
-def classify_child(kpts, confs, bbox_y1, bbox_y2, frame_height):
+DEBUG_CLASSIFIER = True   # set False to hide live ratio overlay
+
+def classify_child(kpts, confs, bbox_y1, bbox_y2, frame_height,
+                   adult_line_y=None, return_debug=False):
+    """
+    PRIMARY: Environmental anchor — if `adult_line_y` is set, compare
+    the person's upper-body keypoint Y against it. Above line (smaller Y)
+    = adult. Below line = child. Robust to crouching, perspective, and
+    leg occlusion (kitchen counter blocking lower body).
+
+    FALLBACK: Anthropometric horizontal ratios (used when line is None
+    or all upper-body keypoints are missing).
+    """
+    # ─── Environmental anchor (overrides ratios when available) ───
+    if adult_line_y is not None:
+        nose = _kpt(kpts, confs, NOSE)
+        l_sh = _kpt(kpts, confs, LEFT_SHOULDER)
+        r_sh = _kpt(kpts, confs, RIGHT_SHOULDER)
+
+        ref_y = None
+        ref_src = ""
+        if l_sh and r_sh:
+            ref_y = (l_sh[1] + r_sh[1]) / 2.0; ref_src = "shoulder_mid"
+        elif nose:
+            ref_y = nose[1]; ref_src = "nose"
+        elif l_sh:
+            ref_y = l_sh[1]; ref_src = "L_shoulder"
+        elif r_sh:
+            ref_y = r_sh[1]; ref_src = "R_shoulder"
+
+        if ref_y is not None:
+            # Image Y grows downward — shoulder BELOW line (larger Y) = child
+            is_child = ref_y > adult_line_y
+            if return_debug:
+                return is_child, {
+                    "method":   "anchor",
+                    "ref_src":  ref_src,
+                    "ref_y":    ref_y,
+                    "line_y":   adult_line_y,
+                    "result":   is_child,
+                }
+            return is_child
+        # Fall through to ratio classifier if no upper keypoints visible
+
+
     """
     Crouch-robust classifier — uses HORIZONTAL measurements only.
 
@@ -162,30 +206,43 @@ def classify_child(kpts, confs, bbox_y1, bbox_y2, frame_height):
         if torso_y > 5:
             crouching = leg_y < torso_y * 0.85
 
+    debug = {}
     scores = []
 
-    # 1. head width / shoulder width — strongest crouch-invariant signal.
-    #    Adults: head ~30-45% of shoulder span. Kids: ~55-75%.
     if head_w is not None and shoulder_w and shoulder_w > 5:
-        scores.append(head_w / shoulder_w > 0.50)
+        r = head_w / shoulder_w
+        v = r > 0.45
+        scores.append(v); debug["hd/sh"] = (r, v)
 
-    # 2. shoulder width / hip width — adults broader shouldered.
     if shoulder_w and hip_w and hip_w > 5:
-        scores.append(shoulder_w / hip_w < 1.20)
+        r = shoulder_w / hip_w
+        v = r < 1.25
+        scores.append(v); debug["sh/hp"] = (r, v)
 
-    # 3. head width / hip width — another horizontal-only ratio.
     if head_w is not None and hip_w and hip_w > 5:
-        scores.append(head_w / hip_w > 0.55)
+        r = head_w / hip_w
+        v = r > 0.50
+        scores.append(v); debug["hd/hp"] = (r, v)
 
-    # 4. Bbox height (only if standing — disabled when crouching).
     if not crouching:
         bbox_h = max(bbox_y2 - bbox_y1, 1)
-        scores.append((bbox_h / frame_height) < 0.55)
+        r = bbox_h / frame_height
+        v = r < 0.60
+        scores.append(v); debug["bbH"] = (r, v)
+
+    debug["n_signals"]   = len(scores)
+    debug["child_votes"] = sum(scores)
+    debug["crouching"]   = crouching
 
     if len(scores) < 2:
-        return False  # insufficient signals — default to adult
-    # Require strict majority — ties classified as adult (safer for demo).
-    return sum(scores) > len(scores) / 2
+        result = False
+    else:
+        result = sum(scores) >= len(scores) / 2
+    debug["result"] = result
+
+    if return_debug:
+        return result, debug
+    return result
 
 # =========================================================
 # PERSON + WRIST STATE
@@ -426,29 +483,110 @@ def draw_hud(img, frame_idx, fps, danger_count, touch_count, active_dangers):
 # ZONE PERSISTENCE
 # =========================================================
 def _load_zones() -> dict:
+    """
+    Returns {video_name: {"stove": np.ndarray(Nx2), "adult_line_y": int|None}}.
+    Supports legacy format (bare list of points) for backward compatibility.
+    """
     if not os.path.exists(ZONES_FILE):
         return {}
     with open(ZONES_FILE, "r") as f:
         raw = yaml.safe_load(f) or {}
-    return {k: np.array(v, dtype=np.int32) for k, v in raw.items()}
+    out = {}
+    for k, v in raw.items():
+        if isinstance(v, dict):
+            out[k] = {
+                "stove":        np.array(v["stove"], dtype=np.int32),
+                "adult_line_y": v.get("adult_line_y"),
+            }
+        else:
+            # Legacy: list of points only, no adult line set
+            out[k] = {"stove": np.array(v, dtype=np.int32), "adult_line_y": None}
+    return out
 
-def _save_zone(video_name: str, poly: np.ndarray):
+def _save_zone(video_name: str, poly: np.ndarray, adult_line_y):
     zones = {}
     if os.path.exists(ZONES_FILE):
         with open(ZONES_FILE, "r") as f:
             zones = yaml.safe_load(f) or {}
-    zones[video_name] = poly.tolist()
+    zones[video_name] = {
+        "stove":        poly.tolist(),
+        "adult_line_y": int(adult_line_y) if adult_line_y is not None else None,
+    }
     with open(ZONES_FILE, "w") as f:
         yaml.safe_dump(zones, f)
     print(f"  Zone saved to {ZONES_FILE}.")
 
 # =========================================================
-# INTERACTIVE POLYGON SETUP — per video, saved to stove_zones.yaml
+# INTERACTIVE SETUP — per video, saves stove polygon + adult line
 # =========================================================
-def get_or_draw_zone(video_name: str, video_path: str, saved_zones: dict) -> np.ndarray:
+def _draw_adult_line_only(video_name: str, video_path: str,
+                          stove_poly: np.ndarray, saved_zones: dict) -> dict:
+    """Prompt user only for the adult shoulder line — polygon already exists."""
+    cap = cv2.VideoCapture(video_path)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        raise RuntimeError(f"Cannot read first frame of {video_path}")
+
+    adult_line_y = [None]
+    done         = [False]
+
+    def callback(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            adult_line_y[0] = y
+
+    WIN = f"Set Adult Line: {video_name}"
+    cv2.namedWindow(WIN)
+    cv2.setMouseCallback(WIN, callback)
+    print("  Click at ADULT shoulder height | C: confirm | S: skip | Q: abort")
+
+    while not done[0]:
+        display = frame.copy()
+        h, w    = display.shape[:2]
+        cv2.polylines(display, [stove_poly], isClosed=True,
+                      color=(0, 0, 255), thickness=2)
+        if adult_line_y[0] is not None:
+            ly = int(adult_line_y[0])
+            cv2.line(display, (0, ly), (w, ly), (255, 200, 0), 2)
+            cv2.putText(display, f"ADULT LINE  y={ly}",
+                        (10, max(ly - 8, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 2)
+        cv2.putText(display, "Click at ADULT shoulder height",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(display, "L: place | C: confirm | S: skip | Q: quit",
+                    (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        cv2.imshow(WIN, display)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            cv2.destroyAllWindows()
+            raise SystemExit("Setup aborted.")
+        if key == ord('c'):
+            if adult_line_y[0] is not None:
+                done[0] = True
+            else:
+                print("  Click to place line first, or press S to skip.")
+        if key == ord('s'):
+            adult_line_y[0] = None
+            done[0] = True
+
+    cv2.destroyAllWindows()
+    _save_zone(video_name, stove_poly, adult_line_y[0])
+    z = {"stove": stove_poly, "adult_line_y": adult_line_y[0]}
+    saved_zones[video_name] = z
+    print(f"  Adult line set: y={adult_line_y[0]}\n")
+    return z
+
+def get_or_draw_zone(video_name: str, video_path: str, saved_zones: dict) -> dict:
     if video_name in saved_zones:
-        print(f"  Loaded saved zone for {video_name} ({len(saved_zones[video_name])} points).")
-        return saved_zones[video_name]
+        z = saved_zones[video_name]
+        if z.get("adult_line_y") is not None:
+            print(f"  Loaded saved zone for {video_name} "
+                  f"({len(z['stove'])} points, adult_line_y={z['adult_line_y']}).")
+            return z
+        # Polygon exists but adult line missing — prompt for line only
+        print(f"  Zone loaded for {video_name} but adult line missing — set it now.")
+        return _draw_adult_line_only(video_name, video_path, z["stove"], saved_zones)
 
     print(f"  No saved zone for '{video_name}' — draw it now.")
     cap = cv2.VideoCapture(video_path)
@@ -457,38 +595,65 @@ def get_or_draw_zone(video_name: str, video_path: str, saved_zones: dict) -> np.
     if not ret:
         raise RuntimeError(f"Cannot read first frame of {video_path}")
 
-    poly_list    = []
-    drawing_done = [False]
+    poly_list      = []
+    adult_line_y   = [None]   # mutable container
+    stage          = ["POLY"] # "POLY" -> "LINE" -> done
+    done           = [False]
 
     def callback(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            poly_list.append([x, y])
-        elif event == cv2.EVENT_RBUTTONDOWN:
-            # Right-click removes last point (undo)
-            if poly_list:
-                poly_list.pop()
+        if stage[0] == "POLY":
+            if event == cv2.EVENT_LBUTTONDOWN:
+                poly_list.append([x, y])
+            elif event == cv2.EVENT_RBUTTONDOWN:
+                if poly_list:
+                    poly_list.pop()
+        elif stage[0] == "LINE":
+            if event == cv2.EVENT_LBUTTONDOWN:
+                adult_line_y[0] = y
+            elif event == cv2.EVENT_MOUSEMOVE and adult_line_y[0] is None:
+                # Hover preview before click
+                adult_line_y[0] = y if flags == 0 else adult_line_y[0]
 
-    WIN = f"Draw Stove Zone: {video_name}"
+    WIN = f"Setup: {video_name}"
     cv2.namedWindow(WIN)
     cv2.setMouseCallback(WIN, callback)
 
-    print("  Left-click: add point | Right-click: undo | C: close polygon | Q: abort")
+    print("  STAGE 1 — Stove polygon")
+    print("    L-click: add point | R-click: undo | C: close polygon | Q: abort")
+    print("  STAGE 2 — Adult shoulder line")
+    print("    L-click anywhere at adult-shoulder height | C: confirm | S: skip line")
 
-    while not drawing_done[0]:
+    while not done[0]:
         display = frame.copy()
+        h, w    = display.shape[:2]
+
+        # Always draw polygon (preview during stage 1, locked after)
         if poly_list:
             pts = np.array(poly_list, np.int32)
-            # Open polyline — does NOT auto-close while drawing
-            cv2.polylines(display, [pts], isClosed=False,
+            cv2.polylines(display, [pts],
+                          isClosed=(stage[0] == "LINE"),
                           color=(0, 0, 255), thickness=2)
             for pt in poly_list:
                 cv2.circle(display, tuple(pt), 5, (0, 255, 0), -1)
 
-        cv2.putText(display,
-                    "L-click: add | R-click: undo | C: close | Q: quit",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(display, f"Points: {len(poly_list)}",
-                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+        if stage[0] == "POLY":
+            cv2.putText(display, f"[1/2] Draw STOVE polygon  |  Points: {len(poly_list)}",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(display, "L: add | R: undo | C: close | Q: quit",
+                        (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        elif stage[0] == "LINE":
+            # Draw current line preview
+            if adult_line_y[0] is not None:
+                ly = int(adult_line_y[0])
+                cv2.line(display, (0, ly), (w, ly), (255, 200, 0), 2)
+                cv2.putText(display, f"ADULT LINE  y={ly}",
+                            (10, max(ly - 8, 20)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 2)
+            cv2.putText(display, "[2/2] Click at ADULT shoulder height",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(display, "L: place line | C: confirm | S: skip | Q: quit",
+                        (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
         cv2.imshow(WIN, display)
         key = cv2.waitKey(1) & 0xFF
@@ -496,23 +661,35 @@ def get_or_draw_zone(video_name: str, video_path: str, saved_zones: dict) -> np.
             cv2.destroyAllWindows()
             raise SystemExit("Setup aborted.")
         if key == ord('c'):
-            if len(poly_list) >= 3:
-                drawing_done[0] = True
-            else:
-                print("  Need at least 3 points to close!")
+            if stage[0] == "POLY":
+                if len(poly_list) >= 3:
+                    stage[0] = "LINE"
+                else:
+                    print("  Need at least 3 points to close polygon!")
+            elif stage[0] == "LINE":
+                if adult_line_y[0] is not None:
+                    done[0] = True
+                else:
+                    print("  Click to place adult line first, or press S to skip.")
+        if key == ord('s') and stage[0] == "LINE":
+            adult_line_y[0] = None
+            done[0] = True
 
     cv2.destroyAllWindows()
     poly = np.array(poly_list, dtype=np.int32)
-    _save_zone(video_name, poly)
-    saved_zones[video_name] = poly
-    print(f"  Zone locked ({len(poly_list)} points).\n")
-    return poly
+    _save_zone(video_name, poly, adult_line_y[0])
+    zone_dict = {"stove": poly, "adult_line_y": adult_line_y[0]}
+    saved_zones[video_name] = zone_dict
+    print(f"  Zone locked: polygon={len(poly_list)}pts  adult_line_y={adult_line_y[0]}\n")
+    return zone_dict
 
 # =========================================================
 # PROCESS ONE VIDEO
 # =========================================================
-def process_video(video_path, stove_poly, video_name):
-    stem        = os.path.splitext(video_name)[0]
+def process_video(video_path, zone_dict, video_name):
+    stove_poly   = zone_dict["stove"]
+    adult_line_y = zone_dict.get("adult_line_y")
+    stem         = os.path.splitext(video_name)[0]
     output_path = os.path.join(OUTPUT_DIR, f"{stem}_detected.avi")
     log_path    = os.path.join(OUTPUT_DIR, f"{stem}_events.json")
 
@@ -606,23 +783,45 @@ def process_video(video_path, stove_poly, video_name):
                         person_states[track_id] = init_person(child_stable_frames)
                     ps = person_states[track_id]
 
-                    vote = classify_child(kpts, confs, y1, y2, height)
+                    vote, dbg = classify_child(kpts, confs, y1, y2, height,
+                                               adult_line_y=adult_line_y,
+                                               return_debug=True)
                     ps["child_vote"].append(vote)
-                    # Need majority of full-window samples — prevents
-                    # first-frame flip and noisy mid-track flicker.
-                    min_samples = max(3, ps["child_vote"].maxlen // 2)
-                    if len(ps["child_vote"]) >= min_samples:
-                        ps["is_child"] = sum(ps["child_vote"]) > len(ps["child_vote"]) / 2
+                    if len(ps["child_vote"]) >= 3:
+                        ps["is_child"] = sum(ps["child_vote"]) >= len(ps["child_vote"]) / 2
+
+                    label_color = (0, 165, 255) if ps["is_child"] else (0, 200, 0)
+                    label_text  = f"{'CHILD' if ps['is_child'] else 'Adult'} #{track_id}"
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), label_color, 2)
+                    cv2.putText(annotated, label_text, (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, label_color, 2)
+
+                    if DEBUG_CLASSIFIER:
+                        dy = y1 + 18
+                        if dbg.get("method") == "anchor":
+                            cv2.putText(annotated,
+                                        f"ANCHOR {dbg['ref_src']} y={int(dbg['ref_y'])}"
+                                        f" vs line={dbg['line_y']}",
+                                        (x1 + 4, dy),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                        (255, 200, 0), 1)
+                        else:
+                            for k in ("hd/sh", "sh/hp", "hd/hp", "bbH"):
+                                if k in dbg:
+                                    ratio, passed = dbg[k]
+                                    txt   = f"{k}={ratio:.2f}{'+' if passed else '-'}"
+                                    color = (0, 200, 255) if passed else (120, 120, 120)
+                                    cv2.putText(annotated, txt, (x1 + 4, dy),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                                    dy += 14
+                            cv2.putText(annotated,
+                                        f"votes {dbg.get('child_votes',0)}/{dbg.get('n_signals',0)}"
+                                        f"{' CR' if dbg.get('crouching') else ''}",
+                                        (x1 + 4, dy),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
                     if not ps["is_child"]:
-                        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 200, 0), 2)
-                        cv2.putText(annotated, f"Adult #{track_id}", (x1, y1 - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 2)
                         continue
-
-                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 165, 255), 2)
-                    cv2.putText(annotated, f"CHILD #{track_id}", (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
 
                     for side, wrist_key, kpt_idx in [
                         ("LEFT",  "left_wrist",  LEFT_WRIST),
@@ -654,6 +853,14 @@ def process_video(video_path, stove_poly, video_name):
                     if (ps["left_wrist"]["state"] == "DANGER" or
                             ps["right_wrist"]["state"] == "DANGER"):
                         active_dangers.append(track_id)
+
+        # Adult shoulder reference line (if defined for this video)
+        if adult_line_y is not None:
+            cv2.line(annotated, (0, adult_line_y),
+                     (annotated.shape[1], adult_line_y),
+                     (255, 200, 0), 1, cv2.LINE_AA)
+            cv2.putText(annotated, "ADULT LINE", (10, max(adult_line_y - 6, 14)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 200, 0), 1)
 
         # Draw stove zone last so it sits on top of person boxes,
         # colored by current frame's active danger state.
@@ -701,8 +908,8 @@ saved_zones = _load_zones()
 for i, video_name in enumerate(VIDEO_FILES, start=1):
     video_path = os.path.join(INPUT_DIR, video_name)
     print(f"\n[{i}/{len(VIDEO_FILES)}] {video_name}")
-    stove_poly = get_or_draw_zone(video_name, video_path, saved_zones)
-    process_video(video_path, stove_poly, video_name)
+    zone = get_or_draw_zone(video_name, video_path, saved_zones)
+    process_video(video_path, zone, video_name)
 
 print(f"\n{'='*50}")
 print(f"  All {len(VIDEO_FILES)} video(s) processed.")

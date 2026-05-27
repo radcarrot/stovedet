@@ -1,5 +1,49 @@
 {
   "danger_count": 0,
-  "touch_count": 0,
-  "events": []
+  "touch_count": 2,
+  "events": [
+    {
+      "event": "TOUCH",
+      "person": 2,
+      "side": "LEFT",
+      "frame": 18,
+      "time_sec": 0.6
+    },
+    {
+      "event": "TOUCH",
+      "person": 2,
+      "side": "RIGHT",
+      "frame": 18,
+      "time_sec": 0.6
+    }
+  ],
+  "vlm_results": [
+    {
+      "verified": true,
+      "is_child": true,
+      "confidence": 0.62,
+      "description": "[MOCK] Confirmed touch \u2014 child wrist near stove zone.",
+      "mock": true,
+      "event_type": "TOUCH",
+      "person_id": 2,
+      "side": "LEFT",
+      "frame_idx": 18,
+      "time_sec": 0.6,
+      "clip_path": "output/clips\\videoplayback_TOUCH_p2_f18.mp4"
+    },
+    {
+      "verified": true,
+      "is_child": true,
+      "confidence": 0.62,
+      "description": "[MOCK] Confirmed touch \u2014 child wrist near stove zone.",
+      "mock": true,
+      "event_type": "TOUCH",
+      "person_id": 2,
+      "side": "RIGHT",
+      "frame_idx": 18,
+      "time_sec": 0.6,
+      "clip_path": "output/clips\\videoplayback_TOUCH_p2_f18.mp4"
+    }
+  ],
+  "vlm_mock_mode": true
 }
