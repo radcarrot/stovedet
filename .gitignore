@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project artifacts
+inputs/
+output/
+stove_zones.yaml
+*.pt
+*.onnx
+*.engine
+
+# Tooling configs (local)
+.claude/
+.claude.json
+.claude/**
+CLAUDE.md
+AGENTS.md
+MEMORY.md
+memory/
+.omc/
+.omc/**
+.codex/
+.anthropic/
+.cursor/
+.aider*
+.copilot/
+*.original.md
+
+# Reference scratch files
+ref.txt
+interact.txt
+
+# Logs
+*.log
