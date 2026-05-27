@@ -294,6 +294,8 @@ def init_person(child_stable_frames):
         "is_child":           False,
         "left_wrist":         _init_wrist(),
         "right_wrist":        _init_wrist(),
+        "left_wrist_history":  deque(maxlen=3),   # Rolling history for smoothing (3 frames)
+        "right_wrist_history": deque(maxlen=3),   # Rolling history for smoothing (3 frames)
     }
 
 def _init_wrist():
@@ -765,12 +767,21 @@ def process_video(video_path, zone_dict, video_name):
                         if not is_valid(pt, conf):
                             continue
 
+                        # Smooth wrist coordinate using 3-frame rolling average
+                        hist_key = f"{wrist_key}_history"
+                        ps[hist_key].append((float(pt[0]), float(pt[1])))
+                        
+                        pts_list = list(ps[hist_key])
+                        smoothed_x = sum(p[0] for p in pts_list) / len(pts_list)
+                        smoothed_y = sum(p[1] for p in pts_list) / len(pts_list)
+                        smoothed_pt = (smoothed_x, smoothed_y)
+
                         prev_state    = ps[wrist_key]["state"]
                         # Calculate dynamic proximity padding based on bounding box width (8% of width, constrained between 10 and 60 pixels)
                         bbox_w = abs(x2 - x1)
                         dyn_proximity = max(10, min(int(bbox_w * 0.08), 60))
                         
-                        ps[wrist_key] = tick_wrist(ps[wrist_key], pt, stove_poly,
+                        ps[wrist_key] = tick_wrist(ps[wrist_key], smoothed_pt, stove_poly,
                                                    touch_frames, danger_frames,
                                                    proximity_px=dyn_proximity)
                         cur_state     = ps[wrist_key]["state"]
@@ -779,8 +790,8 @@ def process_video(video_path, zone_dict, video_name):
                             log_event(cur_state, track_id, side, frame_idx)
 
                         color = STATE_COLOR.get(cur_state, (180, 180, 180))
-                        cv2.circle(annotated, (int(pt[0]), int(pt[1])), 8,  color,         -1)
-                        cv2.circle(annotated, (int(pt[0]), int(pt[1])), 10, (255, 255, 255), 1)
+                        cv2.circle(annotated, (int(smoothed_pt[0]), int(smoothed_pt[1])), 8,  color,         -1)
+                        cv2.circle(annotated, (int(smoothed_pt[0]), int(smoothed_pt[1])), 10, (255, 255, 255), 1)
 
                     if (ps["left_wrist"]["state"] == "DANGER" or
                             ps["right_wrist"]["state"] == "DANGER"):
