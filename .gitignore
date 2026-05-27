@@ -20,9 +20,6 @@ desktop.ini
 *.swo
 
 # Project artifacts
-inputs/
-output/
-stove_zones.yaml
 *.pt
 *.onnx
 *.engine
