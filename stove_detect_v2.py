@@ -29,6 +29,22 @@ VLM_PRE_SEC   = 2.5    # seconds of context before event
 VLM_POST_SEC  = 2.5    # seconds of context after event
 VLM_SAMPLE_N  = 5      # frames sampled from clip for VLM input
 
+# =========================================================
+# LIVE STREAM CONFIG
+# =========================================================
+LIVE_MODE    = False                          # True = live RTSP/webcam, False = batch file processing
+LIVE_SOURCE  = os.getenv("LIVE_SOURCE", "0")  # RTSP URL or webcam index ("0", "1", etc.)
+LIVE_RECORD  = False                          # Record annotated live stream to output/
+LIVE_DISPLAY = True                           # Show cv2.imshow window during live mode
+
+# =========================================================
+# RE-ID CONFIG
+# =========================================================
+REID_ENABLED       = True    # Enable appearance-based Re-ID across track breaks
+REID_HIST_BINS     = 16      # Bins per channel for HSV histogram
+REID_MATCH_THRESH  = 0.55    # cv2.HISTCMP_CORREL minimum (higher = stricter)
+REID_MAX_AGE_SEC   = 3.0     # Max seconds to match against disappeared tracks
+
 os.makedirs(INPUT_DIR,  exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(CLIPS_DIR,  exist_ok=True)
@@ -37,13 +53,16 @@ if os.sep in MODEL_PATH and not os.path.exists(MODEL_PATH):
     raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
 
 _supported = (".mp4", ".avi", ".mov", ".mkv")
-VIDEO_FILES = sorted(
-    f for f in os.listdir(INPUT_DIR) if f.lower().endswith(_supported)
-)
-if not VIDEO_FILES:
-    raise FileNotFoundError(f"No videos found in '{INPUT_DIR}/'. Add videos and rerun.")
-
-print(f"Found {len(VIDEO_FILES)} video(s): {VIDEO_FILES}")
+VIDEO_FILES = []
+if not LIVE_MODE:
+    VIDEO_FILES = sorted(
+        f for f in os.listdir(INPUT_DIR) if f.lower().endswith(_supported)
+    )
+    if not VIDEO_FILES:
+        raise FileNotFoundError(f"No videos found in '{INPUT_DIR}/'. Add videos and rerun.")
+    print(f"Found {len(VIDEO_FILES)} video(s): {VIDEO_FILES}")
+else:
+    print(f"Live mode enabled — source: {LIVE_SOURCE}")
 
 # =========================================================
 # MODEL
@@ -95,6 +114,27 @@ def is_near_stove(pt, poly, proximity_px=None):
         proximity_px = PROXIMITY_PX
     dist = cv2.pointPolygonTest(poly, (float(pt[0]), float(pt[1])), True)
     return dist >= -proximity_px
+
+# =========================================================
+# RE-ID — Appearance Histogram
+# =========================================================
+def compute_appearance(frame, bbox):
+    """Compute a normalized HSV color histogram for a bounding box region.
+    Used for Re-ID matching when ByteTrack loses a track after occlusion."""
+    x1, y1, x2, y2 = bbox
+    h, w = frame.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 - x1 < 5 or y2 - y1 < 5:
+        return None
+    crop = frame[y1:y2, x1:x2]
+    hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1, 2],
+                        None,
+                        [REID_HIST_BINS, REID_HIST_BINS, REID_HIST_BINS],
+                        [0, 180, 0, 256, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist
 
 # =========================================================
 # CHILD DETECTION — Dynamic Stove-Anchor (Approach 1)
@@ -296,6 +336,7 @@ def init_person(child_stable_frames):
         "right_wrist":        _init_wrist(),
         "left_wrist_history":  deque(maxlen=3),   # Rolling history for smoothing (3 frames)
         "right_wrist_history": deque(maxlen=3),   # Rolling history for smoothing (3 frames)
+        "appearance_hist":    None,               # HSV histogram for Re-ID matching
     }
 
 def _init_wrist():
@@ -618,11 +659,17 @@ def get_or_draw_zone(video_name: str, video_path: str, saved_zones: dict) -> dic
 # =========================================================
 # PROCESS ONE VIDEO
 # =========================================================
-def process_video(video_path, zone_dict, video_name):
+def process_video(video_path, zone_dict, video_name, live=False):
     stove_poly = zone_dict["stove"]
     stem       = os.path.splitext(video_name)[0]
-    output_path = os.path.join(OUTPUT_DIR, f"{stem}_detected.avi")
-    log_path    = os.path.join(OUTPUT_DIR, f"{stem}_events.json")
+
+    if live:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(OUTPUT_DIR, f"live_{ts}_detected.avi") if LIVE_RECORD else None
+        log_path    = os.path.join(OUTPUT_DIR, f"live_{ts}_events.json")
+    else:
+        output_path = os.path.join(OUTPUT_DIR, f"{stem}_detected.avi")
+        log_path    = os.path.join(OUTPUT_DIR, f"{stem}_events.json")
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -632,7 +679,8 @@ def process_video(video_path, zone_dict, video_name):
     fps    = round(cap.get(cv2.CAP_PROP_FPS)) or 30
     width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"\n--- {video_name} | {width}x{height} @ {fps}fps ---")
+    mode_label = "LIVE" if live else video_name
+    print(f"\n--- {mode_label} | {width}x{height} @ {fps}fps ---")
 
     _S                  = fps / 30.0
     touch_frames        = max(5,  round(15 * _S))
@@ -640,15 +688,18 @@ def process_video(video_path, zone_dict, video_name):
     stale_frames        = max(10, round(45 * _S))
     child_stable_frames = max(5,  round(10 * _S))
 
-    fourcc = cv2.VideoWriter_fourcc(*"XVID")
-    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    if not writer.isOpened():
-        print(f"[SKIP] Cannot open writer: {output_path}")
-        cap.release()
-        return
+    writer = None
+    if not live or LIVE_RECORD:
+        fourcc = cv2.VideoWriter_fourcc(*"XVID")
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        if not writer.isOpened():
+            print(f"[SKIP] Cannot open writer: {output_path}")
+            cap.release()
+            return
 
     person_states   = {}
     last_seen_frame = {}
+    stale_archive   = {}    # Re-ID: archived appearance + state for disappeared tracks
     event_log       = []
     danger_count    = 0
     touch_count     = 0
@@ -685,12 +736,27 @@ def process_video(video_path, zone_dict, video_name):
 
         annotated = frame.copy()
 
-        # Prune stale tracks
+        # Prune stale tracks — archive appearance for Re-ID before discarding
         stale = [t for t, lf in last_seen_frame.items()
                  if (frame_idx - lf) > stale_frames]
         for t in stale:
+            if REID_ENABLED and t in person_states:
+                ps_old = person_states[t]
+                if ps_old.get("appearance_hist") is not None:
+                    stale_archive[t] = {
+                        "histogram":    ps_old["appearance_hist"],
+                        "person_state": ps_old,
+                        "last_frame":   last_seen_frame[t],
+                    }
             person_states.pop(t, None)
             last_seen_frame.pop(t, None)
+
+        # Expire old Re-ID archive entries
+        if REID_ENABLED and stale_archive:
+            _expired = [k for k, v in stale_archive.items()
+                        if (frame_idx - v["last_frame"]) / fps > REID_MAX_AGE_SEC]
+            for k in _expired:
+                del stale_archive[k]
 
         results = model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)
         active_dangers = []
@@ -710,7 +776,29 @@ def process_video(video_path, zone_dict, video_name):
                     last_seen_frame[track_id] = frame_idx
 
                     if track_id not in person_states:
-                        person_states[track_id] = init_person(child_stable_frames)
+                        _matched = False
+                        if REID_ENABLED and stale_archive:
+                            _new_hist = compute_appearance(frame, (x1, y1, x2, y2))
+                            if _new_hist is not None:
+                                _best_id, _best_corr = None, -1.0
+                                for _old_id, _arch in stale_archive.items():
+                                    _age = (frame_idx - _arch["last_frame"]) / fps
+                                    if _age > REID_MAX_AGE_SEC:
+                                        continue
+                                    _corr = cv2.compareHist(
+                                        _new_hist, _arch["histogram"],
+                                        cv2.HISTCMP_CORREL)
+                                    if _corr > _best_corr:
+                                        _best_corr = _corr
+                                        _best_id   = _old_id
+                                if _best_id is not None and _best_corr >= REID_MATCH_THRESH:
+                                    person_states[track_id] = stale_archive[_best_id]["person_state"]
+                                    del stale_archive[_best_id]
+                                    _matched = True
+                                    print(f"\n[RE-ID] Track #{track_id} \u2190 #{_best_id} "
+                                          f"(corr={_best_corr:.2f})")
+                        if not _matched:
+                            person_states[track_id] = init_person(child_stable_frames)
                     ps = person_states[track_id]
 
                     vote, dbg = classify_child(kpts, confs, y1, y2, height,
@@ -720,6 +808,10 @@ def process_video(video_path, zone_dict, video_name):
                     ps["child_vote"].append(vote)
                     if len(ps["child_vote"]) >= 3:
                         ps["is_child"] = sum(ps["child_vote"]) >= len(ps["child_vote"]) / 2
+
+                    # Update appearance histogram for Re-ID recovery
+                    if REID_ENABLED:
+                        ps["appearance_hist"] = compute_appearance(frame, (x1, y1, x2, y2))
 
                     label_color = (0, 165, 255) if ps["is_child"] else (0, 200, 0)
                     label_text  = f"{'CHILD' if ps['is_child'] else 'Adult'} #{track_id}"
@@ -806,11 +898,22 @@ def process_video(video_path, zone_dict, video_name):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, zone_color, 2)
 
         draw_hud(annotated, frame_idx, fps, danger_count, touch_count, active_dangers)
-        writer.write(annotated)
+        if writer is not None:
+            writer.write(annotated)
         verifier.push_frame(annotated)
 
+        # Live mode: display window + quit check
+        if live and LIVE_DISPLAY:
+            cv2.imshow("Stove Detection - LIVE", annotated)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("\n  [LIVE] Quit requested.")
+                break
+
     cap.release()
-    writer.release()
+    if writer is not None:
+        writer.release()
+    if live:
+        cv2.destroyAllWindows()
 
     print(f"\n  Waiting for VLM verifications to finish...")
     verifier.shutdown(timeout=15.0)
@@ -823,12 +926,14 @@ def process_video(video_path, zone_dict, video_name):
             "events":         event_log,
             "vlm_results":    vlm_results,
             "vlm_mock_mode":  VLM_MOCK_MODE,
+            "live_mode":      live,
         }, f, indent=2)
 
     verified_count = sum(1 for r in vlm_results if r.get("verified") is True)
     print(f"\n  Done. DANGER={danger_count}  TOUCH={touch_count}  "
           f"VLM_VERIFIED={verified_count}/{len(vlm_results)}")
-    print(f"  Video  -> {output_path}")
+    if output_path:
+        print(f"  Video  -> {output_path}")
     print(f"  Events -> {log_path}")
     print(f"  Clips  -> {CLIPS_DIR}/")
 
@@ -837,13 +942,29 @@ def process_video(video_path, zone_dict, video_name):
 # =========================================================
 saved_zones = _load_zones()
 
-for i, video_name in enumerate(VIDEO_FILES, start=1):
-    video_path = os.path.join(INPUT_DIR, video_name)
-    print(f"\n[{i}/{len(VIDEO_FILES)}] {video_name}")
-    zone = get_or_draw_zone(video_name, video_path, saved_zones)
-    process_video(video_path, zone, video_name)
+if LIVE_MODE:
+    # ── Live stream mode ──
+    try:
+        src = int(LIVE_SOURCE)
+    except ValueError:
+        src = LIVE_SOURCE
+    stream_name = f"webcam_{src}" if isinstance(src, int) else "live_stream"
+    print(f"\n[LIVE] Opening source: {LIVE_SOURCE}")
+    zone = get_or_draw_zone(stream_name, src, saved_zones)
+    process_video(src, zone, stream_name, live=True)
+    print(f"\n{'='*50}")
+    print(f"  Live session ended.")
+    print(f"  Outputs in: {OUTPUT_DIR}/")
+    print(f"{'='*50}")
+else:
+    # ── Batch file mode (default) ──
+    for i, video_name in enumerate(VIDEO_FILES, start=1):
+        video_path = os.path.join(INPUT_DIR, video_name)
+        print(f"\n[{i}/{len(VIDEO_FILES)}] {video_name}")
+        zone = get_or_draw_zone(video_name, video_path, saved_zones)
+        process_video(video_path, zone, video_name)
 
-print(f"\n{'='*50}")
-print(f"  All {len(VIDEO_FILES)} video(s) processed using finalized dynamic child detection.")
-print(f"  Outputs in: {OUTPUT_DIR}/")
-print(f"{'='*50}")
+    print(f"\n{'='*50}")
+    print(f"  All {len(VIDEO_FILES)} video(s) processed using finalized dynamic child detection.")
+    print(f"  Outputs in: {OUTPUT_DIR}/")
+    print(f"{'='*50}")
