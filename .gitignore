@@ -44,6 +44,9 @@ memory/
 # Reference scratch files
 ref.txt
 interact.txt
+foragent/
 
 # Logs
 *.log
+
+artifacts/

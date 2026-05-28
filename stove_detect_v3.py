@@ -2,21 +2,47 @@ import os
 import cv2
 import json
 import yaml
+from pathlib import Path
 import time
 import base64
+import ctypes
+import math
 import threading
 import numpy as np
 from ultralytics import YOLO
 from collections import deque
 
+# Auto-detect GStreamer and DeepStream Python Bindings
+DEEPSTREAM_AVAILABLE = False
+try:
+    import gi
+    gi.require_version('Gst', '1.0')
+    from gi.repository import Gst, GLib
+    import pyds
+    DEEPSTREAM_AVAILABLE = True
+except ImportError:
+    pass
+
 # =========================================================
-# PATHS
+# DEEPSTREAM CONFIG (NVIDIA Hardware Acceleration)
 # =========================================================
-MODEL_PATH  = "yolo26l-pose.pt"
+# Auto-enabled if DeepStream bindings are available, but user can override
+DEEPSTREAM_ENABLED   = os.getenv("DEEPSTREAM_ENABLED", str(DEEPSTREAM_AVAILABLE)).lower() == 'true'
+DS_CONFIG_INFER      = "config_infer_yolo_pose.txt"
+DS_CONFIG_TRACKER    = "config_tracker.txt"
+DS_CUSTOM_PARSER_SO  = "./nvdsinfer_custom_impl_Yolo_pose/libnvdsinfer_custom_impl_Yolo_pose.so"
+DS_MODEL_ENGINE      = "yolov8x-pose.engine"
+
+# =========================================================
+# PATHS & DATACENTER MODEL CONFIG
+# =========================================================
+# Use yolov8x-pose.pt in DeepStream/datacenter mode; fallback to local yolo26l-pose.pt for offline Windows testing
+MODEL_PATH  = "yolov8x-pose.pt" if DEEPSTREAM_ENABLED else "yolo26l-pose.pt"
 INPUT_DIR   = "inputs"
 OUTPUT_DIR  = "output"
 CLIPS_DIR   = "output/clips"
 ZONES_FILE  = "stove_zones.yaml"
+
 
 # =========================================================
 # VLM CONFIG — OpenAI-compatible endpoint
@@ -67,8 +93,12 @@ else:
 # =========================================================
 # MODEL
 # =========================================================
-print(f"\nLoading {MODEL_PATH}...")
-model = YOLO(MODEL_PATH)
+model = None
+if not DEEPSTREAM_ENABLED:
+    print(f"\nLoading {MODEL_PATH}...")
+    model = YOLO(MODEL_PATH)
+else:
+    print(f"\n[DEEPSTREAM] Skipping PyTorch model load — inference handled by TensorRT engine.")
 
 # =========================================================
 # CONSTANTS
@@ -115,26 +145,75 @@ def is_near_stove(pt, poly, proximity_px=None):
     dist = cv2.pointPolygonTest(poly, (float(pt[0]), float(pt[1])), True)
     return dist >= -proximity_px
 
+def calculate_angle(A, B, C):
+    """Angle in degrees at joint B formed by segments BA and BC."""
+    BA = (A[0] - B[0], A[1] - B[1])
+    BC = (C[0] - B[0], C[1] - B[1])
+    mag = ((BA[0]**2 + BA[1]**2) ** 0.5) * ((BC[0]**2 + BC[1]**2) ** 0.5)
+    if mag < 1e-6:
+        return None
+    dot = BA[0]*BC[0] + BA[1]*BC[1]
+    return math.degrees(math.acos(max(-1.0, min(1.0, dot / mag))))
+
 # =========================================================
 # RE-ID — Appearance Histogram
 # =========================================================
-def compute_appearance(frame, bbox):
-    """Compute a normalized HSV color histogram for a bounding box region.
-    Used for Re-ID matching when ByteTrack loses a track after occlusion."""
-    x1, y1, x2, y2 = bbox
-    h, w = frame.shape[:2]
+def compute_appearance(frame, bbox, kpts=None, confs=None):
+    """Compute normalized HSV histogram(s) for Re-ID matching.
+    With keypoints: separate torso (shoulder→hip) and leg (hip→ankle) crops
+    concatenated into a single 1D feature vector, eliminating background contamination.
+    Falls back to full bounding box when keypoints are unavailable."""
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    fh, fw = frame.shape[:2]
     x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w, x2), min(h, y2)
+    x2, y2 = min(fw, x2), min(fh, y2)
     if x2 - x1 < 5 or y2 - y1 < 5:
         return None
+
+    def _region_hist(ry1, ry2):
+        ry1, ry2 = max(0, int(ry1)), min(fh, int(ry2))
+        if ry2 - ry1 < 5:
+            return None
+        crop = frame[ry1:ry2, x1:x2]
+        if crop.size == 0:
+            return None
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        h = cv2.calcHist([hsv], [0, 1, 2], None,
+                         [REID_HIST_BINS, REID_HIST_BINS, REID_HIST_BINS],
+                         [0, 180, 0, 256, 0, 256])
+        cv2.normalize(h, h)
+        return h.flatten()
+
+    if kpts is not None:
+        l_sh = _kpt(kpts, confs, LEFT_SHOULDER)
+        r_sh = _kpt(kpts, confs, RIGHT_SHOULDER)
+        l_hp = _kpt(kpts, confs, LEFT_HIP)
+        r_hp = _kpt(kpts, confs, RIGHT_HIP)
+        l_an = _kpt(kpts, confs, LEFT_ANKLE)
+        r_an = _kpt(kpts, confs, RIGHT_ANKLE)
+
+        sh_y  = min(p[1] for p in [l_sh, r_sh] if p is not None) if (l_sh or r_sh) else None
+        hip_y = max(p[1] for p in [l_hp, r_hp] if p is not None) if (l_hp or r_hp) else None
+        an_y  = max(p[1] for p in [l_an, r_an] if p is not None) if (l_an or r_an) else None
+
+        if sh_y is not None and hip_y is not None and an_y is not None:
+            torso_h = _region_hist(sh_y, hip_y)
+            legs_h  = _region_hist(hip_y, an_y)
+            if torso_h is not None and legs_h is not None:
+                combined = np.concatenate([torso_h, legs_h]).astype(np.float32)
+                norm = np.linalg.norm(combined)
+                if norm > 0:
+                    combined /= norm
+                return combined
+
+    # Fallback: full bounding box
     crop = frame[y1:y2, x1:x2]
     hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1, 2],
-                        None,
+    hist = cv2.calcHist([hsv], [0, 1, 2], None,
                         [REID_HIST_BINS, REID_HIST_BINS, REID_HIST_BINS],
                         [0, 180, 0, 256, 0, 256])
     cv2.normalize(hist, hist)
-    return hist
+    return hist.flatten().astype(np.float32)
 
 # =========================================================
 # CHILD DETECTION — Dynamic Stove-Anchor (Approach 1)
@@ -150,8 +229,7 @@ def _midpoint(a, b):
         return ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
     return a if a is not None else b
 
-def _dist(a, b):
-    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
 
 DEBUG_CLASSIFIER = True   # set False to hide live ratio overlay
 
@@ -194,6 +272,26 @@ def classify_child(kpts, confs, bbox_y1, bbox_y2, frame_height,
     sh_mid    = _midpoint(l_sh,  r_sh)
     hip_mid   = _midpoint(l_hip, r_hip)
     ankle_mid = _midpoint(l_an,  r_an)
+    l_kn = _kpt(kpts, confs, LEFT_KNEE)
+    r_kn = _kpt(kpts, confs, RIGHT_KNEE)
+
+    # Biomechanical crouching detection via joint angles
+    is_crouching = False
+    _knee_a, _hip_a = [], []
+    if l_hip and l_kn and l_an:
+        a = calculate_angle(l_hip, l_kn, l_an)
+        if a is not None: _knee_a.append(a)
+    if r_hip and r_kn and r_an:
+        a = calculate_angle(r_hip, r_kn, r_an)
+        if a is not None: _knee_a.append(a)
+    if l_sh and l_hip and l_kn:
+        a = calculate_angle(l_sh, l_hip, l_kn)
+        if a is not None: _hip_a.append(a)
+    if r_sh and r_hip and r_kn:
+        a = calculate_angle(r_sh, r_hip, r_kn)
+        if a is not None: _hip_a.append(a)
+    if any(a < 130 for a in _knee_a) or any(a < 110 for a in _hip_a):
+        is_crouching = True
 
     # 1. Update temporal ratio buffer if keypoints are present
     head_w = None
@@ -210,11 +308,6 @@ def classify_child(kpts, confs, bbox_y1, bbox_y2, frame_height,
 
     # ─── Dynamic Stove-Anchor (Primary Approach 1) ───
     if stove_poly is not None and len(stove_poly) >= 3:
-        l_kn = _kpt(kpts, confs, LEFT_KNEE)
-        r_kn = _kpt(kpts, confs, RIGHT_KNEE)
-        l_hp = _kpt(kpts, confs, LEFT_HIP)
-        r_hp = _kpt(kpts, confs, RIGHT_HIP)
-
         # Estimate ground contact Y (feet)
         y_feet = None
         feet_src = ""
@@ -226,8 +319,8 @@ def classify_child(kpts, confs, bbox_y1, bbox_y2, frame_height,
             y_feet = r_an[1]; feet_src = "R_ankle"
         elif l_kn and r_kn:
             y_feet = (l_kn[1] + r_kn[1]) / 2.0 + 30.0; feet_src = "knees_offset"
-        elif l_hp and r_hp:
-            y_feet = (l_hp[1] + r_hp[1]) / 2.0 + 80.0; feet_src = "hips_offset"
+        elif l_hip and r_hip:
+            y_feet = (l_hip[1] + r_hip[1]) / 2.0 + 80.0; feet_src = "hips_offset"
         else:
             y_feet = float(bbox_y2); feet_src = "bbox_bottom"
 
@@ -252,31 +345,28 @@ def classify_child(kpts, confs, bbox_y1, bbox_y2, frame_height,
             denom = y_feet - y_stove_top
             if denom > 5:
                 ratio = (y_feet - y_shoulder) / denom
-                # Decision threshold: 1.15 (conservatively separates kids at <1.15 from adults)
-                is_child = ratio < 1.15
+                # Crouching adults can drop ratio below 1.15 — tighten threshold when crouching detected
+                child_threshold = 1.05 if is_crouching else 1.15
+                is_child = ratio < child_threshold
 
                 if return_debug:
                     return is_child, {
-                        "method":      "stove_anchor",
-                        "sh_src":      sh_src,
-                        "feet_src":    feet_src,
-                        "ratio":       ratio,
-                        "y_feet":      y_feet,
-                        "y_shoulder":  y_shoulder,
-                        "y_stove_top": y_stove_top,
-                        "result":      is_child,
+                        "method":        "stove_anchor",
+                        "sh_src":        sh_src,
+                        "feet_src":      feet_src,
+                        "ratio":         ratio,
+                        "y_feet":        y_feet,
+                        "y_shoulder":    y_shoulder,
+                        "y_stove_top":   y_stove_top,
+                        "is_crouching":  is_crouching,
+                        "result":        is_child,
                     }
                 return is_child
 
     # ─── Fallback Crouch-Robust Classifier (Horizontal Ratios + Temporal Filtering) ───
     hip_w = abs(r_hip[0] - l_hip[0]) if (l_hip and r_hip) else None
 
-    crouching = False
-    if sh_mid and hip_mid and ankle_mid:
-        torso_y = abs(hip_mid[1] - sh_mid[1])
-        leg_y   = abs(ankle_mid[1] - hip_mid[1])
-        if torso_y > 5:
-            crouching = leg_y < torso_y * 0.85
+    crouching = is_crouching
 
     debug = {}
     scores = []
@@ -340,7 +430,7 @@ def init_person(child_stable_frames):
     }
 
 def _init_wrist():
-    return {"frames_in_zone": 0, "state": "SAFE"}
+    return {"frames_in_zone": 0, "state": "SAFE", "last_trigger_frame": -9999}
 
 def tick_wrist(ws, pt, poly, touch_frames, danger_frames, proximity_px=None):
     if is_near_stove(pt, poly, proximity_px):
@@ -392,6 +482,7 @@ class VLMVerifier:
         self.pending      = []   # events waiting for post-frames
         self.results      = []
         self._results_lock = threading.Lock()
+        self._threads = []
 
         self.client = None
         if not VLM_MOCK_MODE:
@@ -428,6 +519,9 @@ class VLMVerifier:
         self.pending.append(snap)
 
     def _dispatch(self, snap):
+        # Prune finished threads to prevent memory leak
+        self._threads = [t for t in self._threads if t.is_alive()]
+        
         clip_name = (f"{self.video_stem}_{snap['event_type']}_"
                      f"p{snap['person_id']}_f{snap['frame_idx']}.mp4")
         clip_path = os.path.join(CLIPS_DIR, clip_name)
@@ -440,7 +534,9 @@ class VLMVerifier:
                 w_out.write(f)
             w_out.release()
         snap["clip_path"] = clip_path
-        threading.Thread(target=self._call_vlm, args=(snap,), daemon=True).start()
+        t = threading.Thread(target=self._call_vlm, args=(snap,), daemon=True)
+        self._threads.append(t)
+        t.start()
 
     def _sample_frames(self, frames):
         if len(frames) <= VLM_SAMPLE_N:
@@ -521,12 +617,12 @@ class VLMVerifier:
             self._dispatch(p)
         self.pending.clear()
         deadline = time.time() + timeout
-        while time.time() < deadline:
-            alive = [t for t in threading.enumerate()
-                     if t.daemon and t.name.startswith("Thread") and t.is_alive()]
-            if not alive:
+        for t in self._threads:
+            remaining = max(0.1, deadline - time.time())
+            if remaining <= 0:
                 break
-            time.sleep(0.2)
+            t.join(timeout=remaining)
+        self._threads.clear()
 
     def get_results(self):
         with self._results_lock:
@@ -538,6 +634,8 @@ class VLMVerifier:
 # =========================================================
 def draw_hud(img, frame_idx, fps, danger_count, touch_count, active_dangers):
     ih, iw = img.shape[:2]
+    if ih < 150 or iw < 280:
+        return  # Frame too small for HUD overlay
     
     # Sleek dark semi-transparent panel for stats
     x1, y1, x2, y2 = 20, 20, 260, 110
@@ -587,13 +685,15 @@ def _load_zones() -> dict:
         raw = yaml.safe_load(f) or {}
     out = {}
     for k, v in raw.items():
-        if isinstance(v, dict):
-            out[k] = {
-                "stove": np.array(v["stove"], dtype=np.int32),
-            }
-        else:
-            # Backward compatibility with bare list of points
-            out[k] = {"stove": np.array(v, dtype=np.int32)}
+        try:
+            poly_data = v["stove"] if isinstance(v, dict) else v
+            poly = np.array(poly_data, dtype=np.int32)
+            if poly.ndim != 2 or poly.shape[1] != 2:
+                print(f"[WARN] Invalid stove polygon shape for '{k}': expected (N, 2), got {poly.shape}")
+                continue
+            out[k] = {"stove": poly}
+        except Exception as e:
+            print(f"[WARN] Failed to parse zone '{k}': {e}")
     return out
 
 def _save_zone(video_name: str, poly: np.ndarray):
@@ -677,9 +777,496 @@ def get_or_draw_zone(video_name: str, video_path: str, saved_zones: dict) -> dic
     return zone_dict
 
 # =========================================================
-# PROCESS ONE VIDEO
+# DEEPSTREAM CONFIG & TEMPLATE BUILDERS
+# =========================================================
+def generate_default_deepstream_configs():
+    """Generates standard template config files for nvinfer and nvtracker if they do not exist."""
+    if not os.path.exists(DS_CONFIG_INFER):
+        infer_tmpl = f"""[property]
+gpu-id=0
+net-scale-factor=0.003921569790691523
+model-color-format=0
+onnx-model=yolov8x-pose.onnx
+model-engine-file={DS_MODEL_ENGINE}
+labelfile-path=labels.txt
+batch-size=1
+network-mode=1
+num-detected-classes=1
+interval=0
+gie-unique-id=1
+process-mode=1
+network-type=100
+parse-bbox-func-name=NvDsInferParseCustomYoloPose
+custom-lib-path={DS_CUSTOM_PARSER_SO}
+"""
+        with open(DS_CONFIG_INFER, "w") as f:
+            f.write(infer_tmpl)
+        # Create a default labels.txt
+        if not os.path.exists("labels.txt"):
+            with open("labels.txt", "w") as f:
+                f.write("person\n")
+        print(f"  [DEEPSTREAM] Generated template config: {DS_CONFIG_INFER}")
+
+    if not os.path.exists(DS_CONFIG_TRACKER):
+        tracker_tmpl = """[tracker]
+enable-batch-process=1
+tracker-width=640
+tracker-height=384
+ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so
+ll-config-file=/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF.yml
+gpu-id=0
+"""
+        with open(DS_CONFIG_TRACKER, "w") as f:
+            f.write(tracker_tmpl)
+        print(f"  [DEEPSTREAM] Generated template config: {DS_CONFIG_TRACKER}")
+
+# =========================================================
+# DEEPSTREAM PROBES & METADATA PARSERS
+# =========================================================
+def extract_yolo_pose_keypoints(obj_meta):
+    """
+    Extracts 17 keypoint coordinates + confidence from DeepStream custom user metadata.
+    Returns (kpts_xy, kpts_conf) where kpts_xy is (17, 2) and kpts_conf is (17,),
+    or (None, None) if parsing fails.
+    """
+    l_user = obj_meta.user_meta_list
+    while l_user is not None:
+        user_meta = pyds.NvDsUserMeta.cast(l_user.data)
+        if user_meta.base_meta.meta_type == pyds.NvDsMetaType.NVDS_USER_META:
+            try:
+                # The custom parser attaches 17 keypoints * 3 floats (x, y, confidence) = 51 floats total
+                raw_data = ctypes.cast(user_meta.user_meta_data, ctypes.POINTER(ctypes.c_float * 51)).contents
+                kpts = np.array(raw_data).reshape((17, 3))
+                return kpts[:, :2], kpts[:, 2]  # (xy coordinates, confidence scores)
+            except Exception as e:
+                print(f"[WARN] Failed to parse keypoints from user_meta: {e}")
+        l_user = l_user.next
+    return None, None
+
+def draw_ds_stove_label(frame, cx, cy, zone_color):
+    text_sz = 0.5
+    (tw, th), _ = cv2.getTextSize("STOVE", cv2.FONT_HERSHEY_SIMPLEX, text_sz, 2)
+    pad = 6
+    cv2.rectangle(frame, (int(cx) - tw//2 - pad, int(cy) - th - pad), 
+                  (int(cx) + tw//2 + pad, int(cy) + pad), (30, 30, 30), -1)
+    cv2.rectangle(frame, (int(cx) - tw//2 - pad, int(cy) - th - pad), 
+                  (int(cx) + tw//2 + pad, int(cy) + pad), zone_color, 1)
+    cv2.putText(frame, "STOVE", (int(cx) - tw//2, int(cy)),
+                cv2.FONT_HERSHEY_SIMPLEX, text_sz, (255,255,255), 2)
+
+def log_event_ds(event_type, person_id, side, frame_idx, fps, verifier, event_log, u_data):
+    time_sec = round(frame_idx / fps, 2)
+    event_log.append({
+        "event":    event_type,
+        "person":   int(person_id),
+        "side":     side,
+        "frame":    int(frame_idx),
+        "time_sec": time_sec,
+    })
+    if event_type == "DANGER":
+        u_data["danger_count"] += 1
+    elif event_type == "TOUCH":
+        u_data["touch_count"] += 1
+    verifier.trigger(event_type, person_id, side, frame_idx, time_sec)
+    print(f"\n[DEEPSTREAM ALERT][{event_type}] Person #{person_id} {side} "
+          f"@ frame {frame_idx} ({time_sec}s) — VLM verification queued")
+
+def osd_sink_pad_buffer_probe(pad, info, u_data):
+    """
+    DeepStream Buffer Probe: Called for each frame batch inside GStreamer.
+    Accesses metadata, extracts YOLO pose keypoints, runs child classification and state machine,
+    and uses OpenCV to draw the HUD directly on the CUDA hardware frame buffer!
+    """
+    gst_buffer = info.get_buffer()
+    if not gst_buffer:
+        return Gst.PadProbeReturn.OK
+    # CRITICAL: Make the buffer writable before any OpenCV drawing on the frame surface
+    if not gst_buffer.is_writable():
+        gst_buffer = gst_buffer.make_writable()
+
+    # Retrieve DeepStream batch metadata
+    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+    l_frame = batch_meta.frame_meta_list
+    
+    # Load parameters passed via u_data
+    fps = u_data["fps"]
+    stove_poly = u_data["stove_poly"]
+    person_states = u_data["person_states"]
+    last_seen_frame = u_data["last_seen_frame"]
+    stale_archive = u_data["stale_archive"]
+    event_log = u_data["event_log"]
+    verifier = u_data["verifier"]
+    child_stable_frames = u_data["child_stable_frames"]
+    
+    # Timing constants
+    _S = fps / 30.0
+    touch_frames = max(5, round(15 * _S))
+    danger_frames = max(15, round(90 * _S))
+    stale_frames = max(10, round(45 * _S))
+    
+    while l_frame is not None:
+        frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+        frame_idx = frame_meta.frame_num
+        
+        # 1. Retrieve the frame image as a NumPy array (mapped GPU CUDA memory)
+        # Create a CPU copy for all OpenCV drawing; write back to GPU at the end
+        frame = None
+        cpu_frame = None
+        try:
+            frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+            cpu_frame = frame.copy()
+        except Exception as e:
+            print(f"[WARN] Failed to get buffer surface: {e}")
+            
+        # Prune stale tracks — archive appearance for Re-ID before discarding
+        stale = [t for t, lf in last_seen_frame.items() if (frame_idx - lf) > stale_frames]
+        for t in stale:
+            if REID_ENABLED and t in person_states:
+                ps_old = person_states[t]
+                if ps_old.get("appearance_hist") is not None:
+                    stale_archive[t] = {
+                        "histogram":    ps_old["appearance_hist"],
+                        "person_state": ps_old,
+                        "last_frame":   last_seen_frame[t],
+                    }
+            person_states.pop(t, None)
+            last_seen_frame.pop(t, None)
+        
+        # Expire old Re-ID archive entries
+        if REID_ENABLED and stale_archive:
+            _expired = [k for k, v in stale_archive.items()
+                        if (frame_idx - v["last_frame"]) / fps > REID_MAX_AGE_SEC]
+            for k in _expired:
+                del stale_archive[k]
+            
+        active_dangers = []
+        l_obj = frame_meta.obj_meta_list
+        
+        while l_obj is not None:
+            obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+            
+            # Person class (class ID 0 under standard COCO YOLO)
+            if obj_meta.class_id == 0:
+                track_id = obj_meta.object_id
+                last_seen_frame[track_id] = frame_idx
+
+                # Extract keypoints early so spatial Re-ID can use them
+                kpts, kpts_conf = extract_yolo_pose_keypoints(obj_meta)
+                _ds_rect = obj_meta.rect_params
+                _x1 = int(_ds_rect.left)
+                _y1 = int(_ds_rect.top)
+                _x2 = int(_ds_rect.left + _ds_rect.width)
+                _y2 = int(_ds_rect.top + _ds_rect.height)
+                
+                # Initialize track states if new — with Re-ID matching
+                if track_id not in person_states:
+                    _matched = False
+                    if REID_ENABLED and stale_archive and frame is not None:
+                        _new_hist = compute_appearance(frame, (_x1, _y1, _x2, _y2),
+                                                       kpts=kpts, confs=kpts_conf)
+                        if _new_hist is not None:
+                            _best_id, _best_corr = None, -1.0
+                            for _old_id, _arch in stale_archive.items():
+                                _age = (frame_idx - _arch["last_frame"]) / fps
+                                if _age > REID_MAX_AGE_SEC:
+                                    continue
+                                if _new_hist.shape != _arch["histogram"].shape:
+                                    continue
+                                _corr = cv2.compareHist(
+                                    _new_hist, _arch["histogram"],
+                                    cv2.HISTCMP_CORREL)
+                                if _corr > _best_corr:
+                                    _best_corr = _corr
+                                    _best_id   = _old_id
+                            if _best_id is not None and _best_corr >= REID_MATCH_THRESH:
+                                person_states[track_id] = stale_archive[_best_id]["person_state"]
+                                # Reset temporal wrist states across track breaks
+                                person_states[track_id]["left_wrist"] = _init_wrist()
+                                person_states[track_id]["right_wrist"] = _init_wrist()
+                                person_states[track_id]["left_wrist_history"] = deque(maxlen=3)
+                                person_states[track_id]["right_wrist_history"] = deque(maxlen=3)
+                                del stale_archive[_best_id]
+                                _matched = True
+                                print(f"\n[DS RE-ID] Track #{track_id} \u2190 #{_best_id} "
+                                      f"(corr={_best_corr:.2f})")
+                    if not _matched:
+                        person_states[track_id] = init_person(child_stable_frames)
+                ps = person_states[track_id]
+                
+                if kpts is not None:
+                    # Convert box coordinates
+                    rect = obj_meta.rect_params
+                    y1, y2 = rect.top, rect.top + rect.height
+                    x1, x2 = rect.left, rect.left + rect.width
+                    
+                    # Update appearance histogram for Re-ID recovery
+                    if REID_ENABLED and frame is not None:
+                        ps["appearance_hist"] = compute_appearance(
+                            frame, (int(x1), int(y1), int(x2), int(y2)),
+                            kpts=kpts, confs=kpts_conf)
+                    
+                    # 3. Perform Child Classification (now with confidence filtering)
+                    vote, dbg = classify_child(kpts, kpts_conf, y1, y2, frame_meta.source_frame_height,
+                                               stove_poly=stove_poly,
+                                               hs_ratios_history=ps["hs_ratios_history"],
+                                               return_debug=True)
+                    ps["child_vote"].append(vote)
+                    if len(ps["child_vote"]) >= 3:
+                        ps["is_child"] = sum(ps["child_vote"]) >= len(ps["child_vote"]) / 2
+                    
+                    # Update visual labels dynamically in DeepStream OSD metadata!
+                    label_color = (0, 165, 255) if ps["is_child"] else (0, 200, 0)
+                    obj_meta.text_params.display_text = f"{'CHILD' if ps['is_child'] else 'Adult'} #{track_id}"
+                    obj_meta.rect_params.border_color.set(label_color[2]/255.0, label_color[1]/255.0, label_color[0]/255.0, 1.0)
+                    
+                    if ps["is_child"]:
+                        # 4. Wrist State Machine
+                        for side, wrist_key, kpt_idx in [
+                            ("LEFT",  "left_wrist",  LEFT_WRIST),
+                            ("RIGHT", "right_wrist", RIGHT_WRIST),
+                        ]:
+                            pt = kpts[kpt_idx]
+                            conf = float(kpts_conf[kpt_idx]) if kpts_conf is not None else 1.0
+                            if is_valid(pt, conf):
+                                # Smoothing
+                                hist_key = f"{wrist_key}_history"
+                                ps[hist_key].append((float(pt[0]), float(pt[1])))
+                                pts_list = list(ps[hist_key])
+                                smoothed_pt = (sum(p[0] for p in pts_list) / len(pts_list),
+                                               sum(p[1] for p in pts_list) / len(pts_list))
+                                
+                                prev_state = ps[wrist_key]["state"]
+                                dyn_proximity = max(10, min(int((x2 - x1) * 0.08), 60))
+                                
+                                ps[wrist_key] = tick_wrist(ps[wrist_key], smoothed_pt, stove_poly,
+                                                           touch_frames, danger_frames,
+                                                           proximity_px=dyn_proximity)
+                                cur_state = ps[wrist_key]["state"]
+                                
+                                # Trigger alerts & async VLM verification (with cooldown)
+                                cooldown = max(30, int(fps * 5))
+                                if (cur_state != prev_state and cur_state in ("TOUCH", "DANGER")
+                                    and (frame_idx - ps[wrist_key].get("last_trigger_frame", -9999)) > cooldown):
+                                    ps[wrist_key]["last_trigger_frame"] = frame_idx
+                                    log_event_ds(cur_state, track_id, side, frame_idx, fps, verifier, event_log, u_data)
+                                    
+                                if cpu_frame is not None:
+                                    # Draw wrist points on CPU copy (safe from GPU buffer corruption)
+                                    color = STATE_COLOR.get(cur_state, (180, 180, 180))
+                                    cv2.circle(cpu_frame, (int(smoothed_pt[0]), int(smoothed_pt[1])), 8, color, -1)
+                                    cv2.circle(cpu_frame, (int(smoothed_pt[0]), int(smoothed_pt[1])), 10, (255, 255, 255), 1)
+                                    
+                        if ps["left_wrist"]["state"] == "DANGER" or ps["right_wrist"]["state"] == "DANGER":
+                            active_dangers.append(track_id)
+                            
+            l_obj = l_obj.next
+            
+        # 5. Draw global HUD & safety zones on CPU copy, then write back to GPU buffer
+        if cpu_frame is not None:
+            zone_color = (0, 0, 255) if active_dangers else (40, 140, 200)
+            overlay = cpu_frame.copy()
+            cv2.fillPoly(overlay, [stove_poly], zone_color)
+            cv2.addWeighted(overlay, 0.15, cpu_frame, 0.85, 0, dst=cpu_frame)
+            cv2.polylines(cpu_frame, [stove_poly], isClosed=True, color=zone_color, thickness=2)
+            cx, cy = stove_poly.mean(axis=0).astype(int)
+            draw_ds_stove_label(cpu_frame, cx, cy, zone_color)
+            
+            draw_hud(cpu_frame, frame_idx, fps, u_data["danger_count"], u_data["touch_count"], active_dangers)
+            verifier.push_frame(cpu_frame)
+            # Write rendered frame back to GPU-mapped buffer
+            if frame is not None:
+                np.copyto(frame, cpu_frame)
+            
+        l_frame = l_frame.next
+        
+    return Gst.PadProbeReturn.OK
+
+# =========================================================
+# DEEPSTREAM PIPELINE LAUNCHER
+# =========================================================
+def run_deepstream_pipeline(video_path, zone_dict, video_name, live=False):
+    """Constructs and launches the hardware-accelerated NVIDIA DeepStream GStreamer pipeline."""
+    print(f"\n--- Starting NVIDIA DeepStream Pipeline for {video_name} ---")
+    generate_default_deepstream_configs()
+    
+    # Initialize GStreamer
+    Gst.init(None)
+    
+    # Create GStreamer Pipeline Container
+    pipeline = Gst.Pipeline.new("stove-det-pipeline")
+    
+    # Instantiate elements
+    # 1. Source: Ingests local files or RTSP streams dynamically
+    source = Gst.ElementFactory.make("nvurisrcbin", "uri-source")
+    if not live:
+        uri = Path(video_path).resolve().as_uri()
+    else:
+        uri = video_path
+    source.set_property("uri", uri)
+    
+    # Read source resolution & FPS for streammux and timing
+    _src_w, _src_h, fps = 1920, 1080, 30
+    cap = cv2.VideoCapture(video_path)
+    if cap.isOpened():
+        _src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        _src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        _fps = round(cap.get(cv2.CAP_PROP_FPS))
+        if _src_w < 1 or _src_h < 1:
+            print(f"  [WARN] Could not read source resolution, defaulting to 1920x1080")
+            _src_w, _src_h = 1920, 1080
+        if _fps >= 1:
+            fps = _fps
+        cap.release()
+    
+    # 2. Batcher Mux: Batches multiple camera streams into a single memory buffer
+    streammux = Gst.ElementFactory.make("nvstreammux", "stream-muxer")
+    streammux.set_property("width", _src_w)
+    streammux.set_property("height", _src_h)
+    streammux.set_property("batch-size", 1)
+    
+    # 3. Model Inference: nvinfer running YOLOv8x-pose via optimized TensorRT Engine
+    pgie = Gst.ElementFactory.make("nvinfer", "primary-inference")
+    pgie.set_property("config-file-path", DS_CONFIG_INFER)
+    
+    # 4. Multi-Object Tracker: nvtracker running GPU NvDCF correlation filter
+    tracker = Gst.ElementFactory.make("nvtracker", "object-tracker")
+    tracker.set_property("config-file-path", DS_CONFIG_TRACKER)
+    
+    # 5. Core Video Converter
+    nvvidconv = Gst.ElementFactory.make("nvvideoconvert", "converter")
+    
+    # 6. On-Screen Display (OSD): draws parsed bounding boxes & labels
+    nvosd = Gst.ElementFactory.make("nvdsosd", "onscreen-display")
+    
+    # 7. Sinks & Exporters: Hardware H.264 compression & rolling writer
+    nvvidconv2 = Gst.ElementFactory.make("nvvideoconvert", "converter2")
+    encoder = Gst.ElementFactory.make("nvv4l2h264enc", "h264-encoder")
+    parser = Gst.ElementFactory.make("h264parse", "h264-parser")
+    mux = Gst.ElementFactory.make("qtmux", "mp4-muxer")
+    
+    stem = os.path.splitext(video_name)[0]
+    out_path = os.path.join(OUTPUT_DIR, f"{stem}_detected.mp4")
+    
+    if live and LIVE_DISPLAY:
+        sink = Gst.ElementFactory.make("nveglglessink", "display-sink")
+    else:
+        sink = Gst.ElementFactory.make("filesink", "file-sink")
+        sink.set_property("location", out_path)
+    
+    # Add all instantiated elements to the GStreamer Pipeline (with named validation)
+    _elements = {
+        "nvurisrcbin": source, "nvstreammux": streammux, "nvinfer": pgie,
+        "nvtracker": tracker, "nvvideoconvert": nvvidconv, "nvdsosd": nvosd,
+        "nvvideoconvert2": nvvidconv2, "nvv4l2h264enc": encoder,
+        "h264parse": parser, "qtmux": mux, "filesink": sink,
+    }
+    for name, elem in _elements.items():
+        if elem is None:
+            raise RuntimeError(f"[DEEPSTREAM] Failed to create GStreamer element: {name}")
+        pipeline.add(elem)
+        
+    # Link dynamic source: nvurisrcbin uses dynamic pads (pad-added signal callback)
+    sinkpad = streammux.get_request_pad("sink_0")
+    
+    def _on_pad_added(src, new_pad, sinkpad):
+        if not sinkpad.is_linked():
+            new_pad.link(sinkpad)
+    
+    source.connect("pad-added", _on_pad_added, sinkpad)
+    
+    # Link subsequent pipeline elements sequentially
+    streammux.link(pgie)
+    pgie.link(tracker)
+    tracker.link(nvvidconv)
+    nvvidconv.link(nvosd)
+    nvosd.link(nvvidconv2)
+    nvvidconv2.link(encoder)
+    encoder.link(parser)
+    parser.link(mux)
+    mux.link(sink)
+    
+    # ── Setup Shared Probe Context Data ──
+        
+    verifier = VLMVerifier(fps=fps, video_stem=stem)
+    probe_data = {
+        "fps": fps,
+        "stove_poly": zone_dict["stove"],
+        "person_states": {},
+        "last_seen_frame": {},
+        "stale_archive": {},
+        "event_log": [],
+        "verifier": verifier,
+        "child_stable_frames": max(5, round(10 * (fps / 30.0))),
+        "danger_count": 0,
+        "touch_count": 0
+    }
+    
+    # ── Attach Buffer Probe to nvosd's sink pad ──
+    osd_sink_pad = nvosd.get_static_pad("sink")
+    osd_sink_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe, probe_data)
+    
+    # Create GLib Loop & play GStreamer Pipeline
+    loop = GLib.MainLoop()
+    bus = pipeline.get_bus()
+    
+    def bus_call(bus, message, loop):
+        t = message.type
+        if t == Gst.MessageType.EOS:
+            print("\n  [DEEPSTREAM] End-of-stream reached.")
+            loop.quit()
+        elif t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print(f"\n  [DEEPSTREAM ERROR] {err}: {debug}")
+            loop.quit()
+        return True
+        
+    bus.add_signal_watch()
+    bus.connect("message", bus_call, loop)
+    
+    print("  [DEEPSTREAM] Pipeline successfully constructed. Starting GStreamer main loop...")
+    pipeline.set_state(Gst.State.PLAYING)
+    
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        pass
+        
+    # Teardown
+    print("  [DEEPSTREAM] Shutting down GStreamer pipeline.")
+    pipeline.set_state(Gst.State.NULL)
+    verifier.shutdown(timeout=10.0)
+    
+    # Save output events log
+    log_path = os.path.join(OUTPUT_DIR, f"{stem}_events.json")
+    with open(log_path, "w") as f:
+        json.dump({
+            "danger_count": probe_data["danger_count"],
+            "touch_count": probe_data["touch_count"],
+            "events": probe_data["event_log"],
+            "vlm_results": verifier.get_results(),
+            "vlm_mock_mode": VLM_MOCK_MODE,
+            "live_mode": live,
+        }, f, indent=2)
+        
+    print(f"  [DEEPSTREAM DONE] Outputs successfully written to:")
+    print(f"    Video  -> {out_path}")
+    print(f"    Events -> {log_path}")
+
+# =========================================================
+# PROCESS ONE VIDEO — Orchestrated Entrypoint
 # =========================================================
 def process_video(video_path, zone_dict, video_name, live=False):
+    if DEEPSTREAM_ENABLED:
+        if not DEEPSTREAM_AVAILABLE:
+            print("\n[WARNING] DeepStream was enabled but Python bindings (gi, pyds) are not available!")
+            print("          Falling back to CPU / PyTorch sequential execution pipeline.\n")
+            process_video_opencv(video_path, zone_dict, video_name, live)
+        else:
+            run_deepstream_pipeline(video_path, zone_dict, video_name, live)
+    else:
+        process_video_opencv(video_path, zone_dict, video_name, live)
+
+def process_video_opencv(video_path, zone_dict, video_name, live=False):
     stove_poly = zone_dict["stove"]
     stem       = os.path.splitext(video_name)[0]
 
@@ -798,12 +1385,15 @@ def process_video(video_path, zone_dict, video_name, live=False):
                     if track_id not in person_states:
                         _matched = False
                         if REID_ENABLED and stale_archive:
-                            _new_hist = compute_appearance(frame, (x1, y1, x2, y2))
+                            _new_hist = compute_appearance(frame, (x1, y1, x2, y2),
+                                                           kpts=kpts, confs=confs)
                             if _new_hist is not None:
                                 _best_id, _best_corr = None, -1.0
                                 for _old_id, _arch in stale_archive.items():
                                     _age = (frame_idx - _arch["last_frame"]) / fps
                                     if _age > REID_MAX_AGE_SEC:
+                                        continue
+                                    if _new_hist.shape != _arch["histogram"].shape:
                                         continue
                                     _corr = cv2.compareHist(
                                         _new_hist, _arch["histogram"],
@@ -813,6 +1403,11 @@ def process_video(video_path, zone_dict, video_name, live=False):
                                         _best_id   = _old_id
                                 if _best_id is not None and _best_corr >= REID_MATCH_THRESH:
                                     person_states[track_id] = stale_archive[_best_id]["person_state"]
+                                    # Reset temporal wrist states across track breaks
+                                    person_states[track_id]["left_wrist"] = _init_wrist()
+                                    person_states[track_id]["right_wrist"] = _init_wrist()
+                                    person_states[track_id]["left_wrist_history"] = deque(maxlen=3)
+                                    person_states[track_id]["right_wrist_history"] = deque(maxlen=3)
                                     del stale_archive[_best_id]
                                     _matched = True
                                     print(f"\n[RE-ID] Track #{track_id} \u2190 #{_best_id} "
@@ -831,7 +1426,8 @@ def process_video(video_path, zone_dict, video_name, live=False):
 
                     # Update appearance histogram for Re-ID recovery
                     if REID_ENABLED:
-                        ps["appearance_hist"] = compute_appearance(frame, (x1, y1, x2, y2))
+                        ps["appearance_hist"] = compute_appearance(frame, (x1, y1, x2, y2),
+                                                                   kpts=kpts, confs=confs)
 
                     label_color = (0, 165, 255) if ps["is_child"] else (0, 200, 0)
                     label_text  = f"{'CHILD' if ps['is_child'] else 'Adult'} #{track_id}"
@@ -902,7 +1498,10 @@ def process_video(video_path, zone_dict, video_name, live=False):
                                                    proximity_px=dyn_proximity)
                         cur_state     = ps[wrist_key]["state"]
 
-                        if cur_state != prev_state and cur_state in ("TOUCH", "DANGER"):
+                        cooldown = max(30, int(fps * 5))
+                        if (cur_state != prev_state and cur_state in ("TOUCH", "DANGER")
+                            and (frame_idx - ps[wrist_key].get("last_trigger_frame", -9999)) > cooldown):
+                            ps[wrist_key]["last_trigger_frame"] = frame_idx
                             log_event(cur_state, track_id, side, frame_idx)
 
                         color = STATE_COLOR.get(cur_state, (180, 180, 180))
